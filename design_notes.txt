@@ -1,0 +1,138 @@
+================================================================================
+MUNDER DIFFLIN MULTI-AGENT SYSTEM - DESIGN NOTES
+================================================================================
+
+OVERVIEW
+--------
+This system uses pydantic-ai to implement a 4-agent architecture that handles
+customer inquiries for a paper supply company. The agents coordinate through a
+sequential orchestration pattern where a central Orchestrator delegates work to
+three specialist agents.
+
+Framework: pydantic-ai (Agent class with @agent.tool_plain decorators)
+Model: OpenAI-compatible API (gpt-5-nano via Vocareum proxy)
+Database: SQLite (munder_difflin.db) with SQLAlchemy
+Data: pandas DataFrames for inventory generation and transaction management
+
+
+AGENT ARCHITECTURE
+------------------
+
+1. ORCHESTRATOR AGENT (orchestrator_agent)
+   - Entry point for all customer requests
+   - Single tool: handle_customer_request
+   - Normalizes item names from free-text input
+   - Calls the three specialist agents sequentially via run_sync()
+   - Compiles results into a customer-friendly response
+   - Hides internal details (agent names, error traces, margins)
+
+2. INVENTORY AGENT (inventory_agent)
+   - Manages stock levels and reordering
+   - Tools: check_stock_levels, check_reorder_status, place_stock_order,
+            get_full_inventory_report, check_cash_balance_tool, get_company_financials
+   - Enforces cash balance verification before any stock purchase
+   - Uses min_stock_level thresholds to determine reorder needs
+   - Suggests reorder quantities: (min_level - current_stock) + 50 buffer
+
+3. QUOTING AGENT (quoting_agent)
+   - Generates itemized price quotes
+   - Tools: get_pricing_and_availability, quote_history_tool,
+            apply_commission_and_discount
+   - Applies tiered bulk discounts (5%/10%/15% at 100/500/1000 units)
+   - Adds 5% sales commission on all quotes
+   - Applies 0-3% loyalty discount based on historical quote data
+
+4. ORDERING AGENT (ordering_agent)
+   - Finalizes customer purchases as sales transactions
+   - Tools: check_stock_for_order, finalize_order
+   - Always verifies stock before creating a transaction
+   - Never finalizes if stock is insufficient (prevents DB corruption)
+   - Reports transaction ID and remaining stock on success
+
+
+ORCHESTRATION PROCESS
+---------------------
+The handle_customer_request tool inside the Orchestrator executes a 3-step
+sequential workflow for every customer request:
+
+  Step 1: QUOTING
+  ---------------
+  - The Orchestrator calls quoting_agent.run_sync() with a prompt asking for
+    a detailed quote including pricing, stock status, and delivery estimates
+  - The Quoting Agent uses its tools to:
+    * Look up unit prices and current stock (get_pricing_and_availability)
+    * Search historical quotes for discount context (quote_history_tool)
+    * Calculate final price with discounts and commission (apply_commission_and_discount)
+  - Returns: itemized quote with per-item breakdown
+
+  Step 2: INVENTORY CHECK & REORDER
+  ----------------------------------
+  - The Orchestrator calls inventory_agent.run_sync() with a prompt asking to
+    check stock levels and reorder if needed
+  - The Inventory Agent uses its tools to:
+    * Check current stock for each requested item (check_stock_levels)
+    * Assess if items are below minimum thresholds (check_reorder_status)
+    * Verify cash balance before ordering (check_cash_balance_tool)
+    * Place stock orders if funds are available (place_stock_order)
+  - Returns: stock status report and any reorder confirmations
+
+  Step 3: ORDER FINALIZATION
+  --------------------------
+  - The Orchestrator calls ordering_agent.run_sync() with a prompt including
+    the inventory status and quote details
+  - The Ordering Agent uses its tools to:
+    * Verify stock is sufficient for each item (check_stock_for_order)
+    * Create sales transactions for fulfillable items (finalize_order)
+  - Returns: order confirmation with transaction IDs, or failure reasons
+
+  Final: RESPONSE COMPILATION
+  ----------------------------
+  - The handle_customer_request tool combines outputs from all three steps
+  - The Orchestrator Agent formats this into a customer-friendly response
+  - Internal details are filtered out per the system prompt rules
+
+
+DATA FLOW
+---------
+Customer Request (text + date)
+    |
+    v
+Orchestrator Agent
+    |-- _normalize_item_names() --> cleaned request text
+    |
+    |-- Step 1 --> Quoting Agent --> quote with pricing
+    |-- Step 2 --> Inventory Agent --> stock status + reorders
+    |-- Step 3 --> Ordering Agent --> sales transactions
+    |
+    v
+Compiled Response --> Customer
+
+
+DATABASE SCHEMA
+---------------
+- transactions: id, item_name, transaction_type (stock_orders/sales), units, price, transaction_date
+- inventory: item_name, category, unit_price, current_stock, min_stock_level
+- quotes: request_id, total_amount, quote_explanation, order_date, job_type, order_size, event_type
+- quote_requests: id, response (original customer request text)
+
+
+KEY DESIGN DECISIONS
+--------------------
+1. Sequential orchestration (not parallel) ensures inventory is restocked
+   before the ordering agent attempts to finalize, preventing stock failures.
+
+2. Cash balance verification is mandatory before any stock purchase to prevent
+   the company from overspending.
+
+3. The Orchestrator uses a single tool (handle_customer_request) rather than
+   exposing sub-agents directly, keeping the coordination logic deterministic
+   and predictable.
+
+4. Each agent operates independently with its own system prompt and tools,
+   making the system modular and easy to test in isolation.
+
+5. All agents use run_sync() for synchronous execution within the orchestrator's
+   tool, avoiding async complexity in the coordination layer.
+
+6. Delivery timelines scale with order size (same-day for <=10, up to 7 days
+   for 1000+), reflecting realistic supplier logistics.
